@@ -1,0 +1,191 @@
+"""gates and speed for the fused triton per slice cqt.
+
+run   python bench/fused_gpu.py           on a cuda machine, paste back the output
+run   python bench/fused_gpu.py --check   anywhere, no triton needed
+
+the check mode validates the kernel tables and dataflow through the torch
+simulator in flash_cqt/fused.py against the eager transform, per block family
+and roundtrip. the cuda run then gates each kernel against that simulator
+(any mismatch names its kernel), sweeps the precision knob, and times the
+fused path against the two measured bars, 0.542 ms per slice at B 1 and 28 us
+per slice at B 128 (graphed cufft on the a100).
+"""
+import sys
+import pathlib
+import torch
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from flash_cqt import OctCQT
+from flash_cqt.fused import FusedOctCQT, HAVE_TRITON
+
+FS = 44100
+SL = 65536
+NUM_OCTS = [3, 4, 2]
+BINS = [8, 16, 32]
+REPS = 100
+
+
+def snr_db(x, xh):
+    #works for real and complex alike
+    d = ((x - xh).abs().float() ** 2).sum()
+    e = (x.abs().float() ** 2).sum()
+    return (10 * torch.log10(e / d)).item() if d > 0 else float("inf")
+
+
+def build(device):
+    cqt = OctCQT(NUM_OCTS, BINS, fs=FS, audio_len=SL, device=device)
+    return cqt, FusedOctCQT(cqt, device)
+
+
+def check_sim(device):
+    #simulator against the eager transform, this validates every table
+    print(f"== simulator gates on {device}, fp32 ==")
+    torch.manual_seed(0)
+    cqt, f = build(device)
+    x = torch.randn(2, SL, device=device)
+    ok = True
+    with torch.no_grad():
+        blocks, side = cqt.fwd(x)
+        eager = list(blocks) + list(side)
+        KR, KI = f.sim_fwd(x)
+        ours = f.blocks_view(KR, KI)
+        worst = min(snr_db(a, b) for a, b in zip(eager, ours))
+        print(f"forward blocks vs eager, worst family  {worst:8.2f} db")
+        ok &= worst > 100
+        xo = f.sim_bwd(KR, KI)
+        v = snr_db(x, xo)
+        print(f"simulator roundtrip                    {v:8.2f} db")
+        ok &= v > 100
+        xe = cqt.bwd(blocks, side)
+        v = snr_db(xe, xo)
+        print(f"simulator inverse vs eager inverse     {v:8.2f} db")
+        ok &= v > 100
+    print("gates", "PASSED" if ok else "FAILED")
+    return ok
+
+
+def ev_ms(fn, reps=REPS):
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    ts = []
+    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+    for _ in range(reps):
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        ts.append(start.elapsed_time(end))
+    ts.sort()
+    return ts[len(ts) // 2]
+
+
+def capture(fn):
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    return g
+
+
+def main():
+    if not torch.cuda.is_available():
+        print("no cuda device found, run with --check for the cpu gates")
+        sys.exit(1)
+    if not HAVE_TRITON:
+        print("triton is not importable in this environment")
+        sys.exit(1)
+    dev = "cuda"
+    print(f"gpu {torch.cuda.get_device_name(0)}  torch {torch.__version__}  "
+          f"cuda {torch.version.cuda}")
+    print(f"config fs {FS} sl_len {SL} num_octs {NUM_OCTS} bins {BINS}\n")
+    if not check_sim(dev):
+        print("aborting, the simulator must match eager before kernels mean anything")
+        sys.exit(1)
+
+    torch.manual_seed(0)
+    cqt, f = build(dev)
+    x = torch.randn(1, SL, device=dev)
+    ok = True
+
+    #kernel against simulator, stage by stage, fp32
+    print("\n== kernel gates against the simulator, fp32 ==")
+    f.prec = "ieee"
+    with torch.no_grad():
+        sKR, sKI = f.sim_fwd(x)
+        KR, KI = f.fwd(x)
+        v = snr_db(torch.complex(sKR, sKI), torch.complex(KR, KI))
+        print(f"forward kernels vs simulator   {v:8.2f} db")
+        ok &= v > 100
+        sxo = f.sim_bwd(sKR, sKI)
+        xo = f.bwd(sKR.clone(), sKI.clone())
+        v = snr_db(sxo, xo)
+        print(f"inverse kernels vs simulator   {v:8.2f} db")
+        ok &= v > 100
+        xo = f.bwd(*f.fwd(x))
+        v = snr_db(x, xo)
+        print(f"fused roundtrip vs input       {v:8.2f} db")
+        ok &= v > 100
+    if not ok:
+        print("kernel gates FAILED, timings below are for debugging only")
+
+    #precision knob
+    print("\n== precision knob, per slice roundtrip B 1 ==")
+    print(f"{'prec':<8} | {'snr_db':>8} | {'eager_ms':>9} {'graph_ms':>9}")
+    print("-" * 44)
+    results = {}
+    with torch.no_grad():
+        for prec in ("ieee", "tf32", "tf32x3"):
+            f.prec = prec
+            try:
+                rt = lambda: f.bwd(*f.fwd(x))
+                v = snr_db(x, rt())
+                e = ev_ms(rt)
+                g = capture(rt)
+                gm = ev_ms(g.replay)
+                results[prec] = (v, gm)
+                print(f"{prec:<8} | {v:>8.2f} | {e:>9.3f} {gm:>9.3f}")
+            except Exception as exc:
+                print(f"{prec:<8} | SKIPPED {type(exc).__name__}: {str(exc)[:70]}")
+    f.prec = "ieee"
+
+    #the bars
+    print("\n== against the cufft baseline, graphed, per slice ==")
+    print(f"{'B':>4} | {'cufft_ms':>9} {'us/slice':>9} | {'fused_ms':>9} {'us/slice':>9} | {'speedup':>7}")
+    print("-" * 64)
+    with torch.no_grad():
+        for B in (1, 8, 32, 128):
+            xb = torch.randn(B, SL, device=dev)
+            def cu_rt():
+                bl, sd = cqt.fwd(xb)
+                return cqt.bwd(bl, sd)
+            g = capture(cu_rt)
+            a = ev_ms(g.replay)
+            f._workspace(B)
+            g = capture(lambda: f.bwd(*f.fwd(xb)))
+            b_ = ev_ms(g.replay)
+            print(f"{B:>4} | {a:>9.3f} {1000 * a / B:>9.1f} | "
+                  f"{b_:>9.3f} {1000 * b_ / B:>9.1f} | {a / b_:>7.2f}x")
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    with torch.no_grad():
+        f.bwd(*f.fwd(x))
+    torch.cuda.synchronize()
+    print(f"\npeak cuda memory at B 1  {torch.cuda.max_memory_allocated() / 1e6:.1f} MB")
+
+    if "ieee" in results:
+        v, gm = results["ieee"]
+        print(f"\nsummary  fused fp32 graphed {gm:.3f} ms per slice at {v:.1f} db, "
+              f"bars were 0.542 ms (B 1) and 0.028 ms (B 128, per slice)")
+
+
+if __name__ == "__main__":
+    if "--check" in sys.argv:
+        sys.exit(0 if check_sim("cpu") else 1)
+    main()

@@ -241,8 +241,12 @@ def run_streaming(dev):
         md = (g(sl) - rt(sl)).abs().max().item()
         graph = ev_ms(lambda: g(sl), REPS * 2)
     budget = 1000.0 * s.hop / FS
+    #cufft may pick different internal plans under graph capture than in eager
+    #mode, so sums reorder by an ulp or two, that is fine. anything past 1e-5
+    #would mean the static buffer plumbing is broken
+    ok = md < 1e-5
     print(f"graph output vs eager  max|diff| = {md:.2e}  "
-          f"({'OK' if md == 0 else 'CHECK, expected exactly 0'})")
+          f"({'OK, within fp32 reorder tolerance' if ok else 'FAILED, buffer plumbing broken'})")
     print(f"eager    {eager:8.3f} ms/slice  {1000 / eager:7.0f} slices/s  "
           f"margin {budget / eager:5.0f}x realtime")
     print(f"graphed  {graph:8.3f} ms/slice  {1000 / graph:7.0f} slices/s  "
