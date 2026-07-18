@@ -154,6 +154,28 @@ def main():
                 print(f"{prec:<8} | SKIPPED {type(exc).__name__}: {str(exc)[:70]}")
     f.prec = "ieee"
 
+    #which kernel eats the time, medians per launch
+    print("\n== per kernel breakdown, fp32 ==")
+    with torch.no_grad():
+        p1 = f.bench_parts(x)
+        x32 = torch.randn(32, SL, device=dev)
+        f._workspace(32)
+        p32 = f.bench_parts(x32)
+    print(f"{'kernel':<16} | {'B1_ms':>8} | {'B32_ms':>8}")
+    print("-" * 40)
+    for (n1, v1), (_, v32) in zip(p1, p32):
+        print(f"{n1:<16} | {v1:>8.3f} | {v32:>8.3f}")
+
+    #peak memory before the batch loop fills the workspace cache, so the
+    #number means one B 1 roundtrip and not the sum of every batch size
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    with torch.no_grad():
+        f.bwd(*f.fwd(x))
+    torch.cuda.synchronize()
+    print(f"\npeak cuda memory at B 1 (plus the B 32 workspace above)  "
+          f"{torch.cuda.max_memory_allocated() / 1e6:.1f} MB")
+
     #the bars
     print("\n== against the cufft baseline, graphed, per slice ==")
     print(f"{'B':>4} | {'cufft_ms':>9} {'us/slice':>9} | {'fused_ms':>9} {'us/slice':>9} | {'speedup':>7}")
@@ -171,13 +193,6 @@ def main():
             b_ = ev_ms(g.replay)
             print(f"{B:>4} | {a:>9.3f} {1000 * a / B:>9.1f} | "
                   f"{b_:>9.3f} {1000 * b_ / B:>9.1f} | {a / b_:>7.2f}x")
-
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    with torch.no_grad():
-        f.bwd(*f.fwd(x))
-    torch.cuda.synchronize()
-    print(f"\npeak cuda memory at B 1  {torch.cuda.max_memory_allocated() / 1e6:.1f} MB")
 
     if "ieee" in results:
         v, gm = results["ieee"]

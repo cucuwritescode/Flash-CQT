@@ -308,7 +308,10 @@ class FusedOctCQT:
         xo = D.real.transpose(1, 2).reshape(B, N) / N
         return xo
 
-    #triton launchers
+    #triton launchers. num_stages caps triton's load pipelining, the inverse
+    #stage1 has four dot operands and at the default depth its shared memory
+    #blows past the a100 limit (measured, 172032 required vs 166912
+    #available), two stages fit everywhere
 
     def fwd(self, x):
         B = x.shape[0]
@@ -316,22 +319,24 @@ class FusedOctCQT:
         prec = getattr(self, "prec", "ieee")
         _stage1[(B, R // 32, R // 128)](
             x, w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], HALF, IS_INV=False, PREC=prec)
+            w["CR"], w["CI"], HALF, IS_INV=False, PREC=prec,
+            num_warps=8, num_stages=2)
         _stage2[(B, R // 32, R // 128)](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
-            1.0 / N, IS_INV=False, PREC=prec)
+            1.0 / N, IS_INV=False, PREC=prec, num_warps=8, num_stages=2)
         _block_direct[(self.d_task.shape[0], B)](
             w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
             self.d_pidx, self.d_wre, self.d_wim, self.d_wir, self.d_wii,
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
-            IS_FWD=True, PREC=prec)
+            IS_FWD=True, PREC=prec, num_warps=4, num_stages=2)
         for t in self.two:
             _block_two[(t["task"].shape[0], B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=True, PREC=prec)
+                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=True, PREC=prec,
+                num_warps=4, num_stages=2)
         return w["KR"], w["KI"]
 
     def bwd(self, KR, KI):
@@ -344,21 +349,91 @@ class FusedOctCQT:
             w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
             self.d_pidx, self.d_wre, self.d_wim, self.d_fmr, self.d_fmi,
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
-            IS_FWD=False, PREC=prec)
+            IS_FWD=False, PREC=prec, num_warps=4, num_stages=2)
         for t in self.two:
             _block_two[(t["task"].shape[0], B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=False, PREC=prec)
+                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=False, PREC=prec,
+                num_warps=4, num_stages=2)
         _stage1[(B, R // 32, R // 128)](
             w["XO"], w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], HALF, IS_INV=True, PREC=prec)
+            w["CR"], w["CI"], HALF, IS_INV=True, PREC=prec,
+            num_warps=8, num_stages=2)
         _stage2[(B, R // 32, R // 128)](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
-            1.0 / N, IS_INV=True, PREC=prec)
+            1.0 / N, IS_INV=True, PREC=prec, num_warps=8, num_stages=2)
         return w["XO"]
+
+    def bench_parts(self, x, reps=50):
+        #median ms per kernel launch, diagnosis only, names the kernel that
+        #eats the time instead of guessing. mirrors the launch lines above
+        B = x.shape[0]
+        w = self._workspace(B)
+        prec = getattr(self, "prec", "ieee")
+        KR, KI = self.fwd(x)
+        self.bwd(KR, KI)
+
+        def med(fn):
+            for _ in range(3):
+                fn()
+            torch.cuda.synchronize()
+            ts = []
+            s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+            for _ in range(reps):
+                s.record()
+                fn()
+                e.record()
+                torch.cuda.synchronize()
+                ts.append(s.elapsed_time(e))
+            ts.sort()
+            return ts[len(ts) // 2]
+
+        parts = [("fwd stage1", med(lambda: _stage1[(B, R // 32, R // 128)](
+            x, w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
+            w["CR"], w["CI"], HALF, IS_INV=False, PREC=prec,
+            num_warps=8, num_stages=2)))]
+        parts.append(("fwd stage2", med(lambda: _stage2[(B, R // 32, R // 128)](
+            w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
+            1.0 / N, IS_INV=False, PREC=prec, num_warps=8, num_stages=2))))
+        parts.append(("fwd direct", med(lambda: _block_direct[(self.d_task.shape[0], B)](
+            w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
+            self.d_pidx, self.d_wre, self.d_wim, self.d_wir, self.d_wii,
+            self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
+            IS_FWD=True, PREC=prec, num_warps=4, num_stages=2))))
+        for t in self.two:
+            parts.append((f"fwd two {t['N1']}x{t['N2']}",
+                          med(lambda t=t: _block_two[(t["task"].shape[0], B)](
+                w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
+                t["pidx"], t["wre"], t["wim"],
+                t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
+                t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
+                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=True, PREC=prec,
+                num_warps=4, num_stages=2))))
+        parts.append(("inv direct", med(lambda: _block_direct[(self.d_task.shape[0], B)](
+            w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
+            self.d_pidx, self.d_wre, self.d_wim, self.d_fmr, self.d_fmi,
+            self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
+            IS_FWD=False, PREC=prec, num_warps=4, num_stages=2))))
+        for t in self.two:
+            parts.append((f"inv two {t['N1']}x{t['N2']}",
+                          med(lambda t=t: _block_two[(t["task"].shape[0], B)](
+                w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
+                t["pidx"], t["wre"], t["wim"],
+                t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
+                t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
+                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=False, PREC=prec,
+                num_warps=4, num_stages=2))))
+        parts.append(("inv stage1", med(lambda: _stage1[(B, R // 32, R // 128)](
+            w["XO"], w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
+            w["CR"], w["CI"], HALF, IS_INV=True, PREC=prec,
+            num_warps=8, num_stages=2))))
+        parts.append(("inv stage2", med(lambda: _stage2[(B, R // 32, R // 128)](
+            w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
+            1.0 / N, IS_INV=True, PREC=prec, num_warps=8, num_stages=2))))
+        return parts
 
 
 if HAVE_TRITON:
