@@ -176,10 +176,11 @@ def main():
     print(f"\npeak cuda memory at B 1 (plus the B 32 workspace above)  "
           f"{torch.cuda.max_memory_allocated() / 1e6:.1f} MB")
 
-    #the bars
+    #the bars, fp32 and the tensor core mode that held 117 db side by side
     print("\n== against the cufft baseline, graphed, per slice ==")
-    print(f"{'B':>4} | {'cufft_ms':>9} {'us/slice':>9} | {'fused_ms':>9} {'us/slice':>9} | {'speedup':>7}")
-    print("-" * 64)
+    print(f"{'B':>4} | {'cufft_ms':>9} | {'fp32_ms':>9} {'speedup':>7} | "
+          f"{'tf32x3_ms':>9} {'speedup':>7}")
+    print("-" * 62)
     with torch.no_grad():
         for B in (1, 8, 32, 128):
             xb = torch.randn(B, SL, device=dev)
@@ -189,10 +190,18 @@ def main():
             g = capture(cu_rt)
             a = ev_ms(g.replay)
             f._workspace(B)
+            f.prec = "ieee"
             g = capture(lambda: f.bwd(*f.fwd(xb)))
             b_ = ev_ms(g.replay)
-            print(f"{B:>4} | {a:>9.3f} {1000 * a / B:>9.1f} | "
-                  f"{b_:>9.3f} {1000 * b_ / B:>9.1f} | {a / b_:>7.2f}x")
+            try:
+                f.prec = "tf32x3"
+                g = capture(lambda: f.bwd(*f.fwd(xb)))
+                c_ = ev_ms(g.replay)
+                tail = f"{c_:>9.3f} {a / c_:>6.2f}x"
+            except Exception as exc:
+                tail = f"SKIPPED {type(exc).__name__}"
+            f.prec = "ieee"
+            print(f"{B:>4} | {a:>9.3f} | {b_:>9.3f} {a / b_:>6.2f}x | {tail}")
 
     if "ieee" in results:
         v, gm = results["ieee"]

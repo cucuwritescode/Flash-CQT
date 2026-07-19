@@ -169,8 +169,10 @@ class FusedOctCQT:
 
         self.two = []
         for (N1, N2), t in sorted(two.items()):
+            #wide buckets split each bin's second stage across programs so
+            #the launch fills more of the card, 33 programs was not enough
             self.two.append(dict(
-                N1=N1, N2=N2, scale=t["scale"],
+                N1=N1, N2=N2, scale=t["scale"], split=4 if N2 >= 64 else 1,
                 F1R=t["F1R"], F1I=t["F1I"], F2R=t["F2R"], F2I=t["F2I"],
                 TWR=t["TWR"], TWI=t["TWI"],
                 pidx=cat(t["pidx"], torch.int32),
@@ -317,9 +319,11 @@ class FusedOctCQT:
         B = x.shape[0]
         w = self._workspace(B)
         prec = getattr(self, "prec", "ieee")
+        #DR DI are passed to stage1 as the inverse input planes, unused in
+        #the forward branch, any tensor of the right size does
         _stage1[(B, R // 32, R // 128)](
-            x, w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], HALF, IS_INV=False, PREC=prec,
+            x, w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
+            w["CR"], w["CI"], IS_INV=False, PREC=prec,
             num_warps=8, num_stages=2)
         _stage2[(B, R // 32, R // 128)](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
@@ -330,13 +334,13 @@ class FusedOctCQT:
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=True, PREC=prec, num_warps=4, num_stages=2)
         for t in self.two:
-            _block_two[(t["task"].shape[0], B)](
+            _block_two[(t["task"].shape[0] * t["split"], B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=True, PREC=prec,
-                num_warps=4, num_stages=2)
+                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=t["split"],
+                IS_FWD=True, PREC=prec, num_warps=4, num_stages=2)
         return w["KR"], w["KI"]
 
     def bwd(self, KR, KI):
@@ -351,16 +355,20 @@ class FusedOctCQT:
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=False, PREC=prec, num_warps=4, num_stages=2)
         for t in self.two:
-            _block_two[(t["task"].shape[0], B)](
+            _block_two[(t["task"].shape[0] * t["split"], B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=False, PREC=prec,
-                num_warps=4, num_stages=2)
+                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=t["split"],
+                IS_FWD=False, PREC=prec, num_warps=4, num_stages=2)
+        #expand the half spectrum into full conjugated planes so stage1
+        #loads contiguously, DR DI are free in this direction
+        _mirror[(B, N // 1024)](
+            w["FR"], w["FI"], w["DR"], w["DI"], HALF, BLOCK=1024)
         _stage1[(B, R // 32, R // 128)](
-            w["XO"], w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], HALF, IS_INV=True, PREC=prec,
+            w["XO"], w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
+            w["CR"], w["CI"], IS_INV=True, PREC=prec,
             num_warps=8, num_stages=2)
         _stage2[(B, R // 32, R // 128)](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
@@ -392,8 +400,8 @@ class FusedOctCQT:
             return ts[len(ts) // 2]
 
         parts = [("fwd stage1", med(lambda: _stage1[(B, R // 32, R // 128)](
-            x, w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], HALF, IS_INV=False, PREC=prec,
+            x, w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
+            w["CR"], w["CI"], IS_INV=False, PREC=prec,
             num_warps=8, num_stages=2)))]
         parts.append(("fwd stage2", med(lambda: _stage2[(B, R // 32, R // 128)](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
@@ -405,13 +413,13 @@ class FusedOctCQT:
             IS_FWD=True, PREC=prec, num_warps=4, num_stages=2))))
         for t in self.two:
             parts.append((f"fwd two {t['N1']}x{t['N2']}",
-                          med(lambda t=t: _block_two[(t["task"].shape[0], B)](
+                          med(lambda t=t: _block_two[(t["task"].shape[0] * t["split"], B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=True, PREC=prec,
-                num_warps=4, num_stages=2))))
+                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=t["split"],
+                IS_FWD=True, PREC=prec, num_warps=4, num_stages=2))))
         parts.append(("inv direct", med(lambda: _block_direct[(self.d_task.shape[0], B)](
             w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
             self.d_pidx, self.d_wre, self.d_wim, self.d_fmr, self.d_fmi,
@@ -419,16 +427,18 @@ class FusedOctCQT:
             IS_FWD=False, PREC=prec, num_warps=4, num_stages=2))))
         for t in self.two:
             parts.append((f"inv two {t['N1']}x{t['N2']}",
-                          med(lambda t=t: _block_two[(t["task"].shape[0], B)](
+                          med(lambda t=t: _block_two[(t["task"].shape[0] * t["split"], B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], IS_FWD=False, PREC=prec,
-                num_warps=4, num_stages=2))))
+                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=t["split"],
+                IS_FWD=False, PREC=prec, num_warps=4, num_stages=2))))
+        parts.append(("inv mirror", med(lambda: _mirror[(B, N // 1024)](
+            w["FR"], w["FI"], w["DR"], w["DI"], HALF, BLOCK=1024))))
         parts.append(("inv stage1", med(lambda: _stage1[(B, R // 32, R // 128)](
-            w["XO"], w["FR"], w["FI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], HALF, IS_INV=True, PREC=prec,
+            w["XO"], w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
+            w["CR"], w["CI"], IS_INV=True, PREC=prec,
             num_warps=8, num_stages=2))))
         parts.append(("inv stage2", med(lambda: _stage2[(B, R // 32, R // 128)](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
@@ -439,11 +449,28 @@ class FusedOctCQT:
 if HAVE_TRITON:
 
     @triton.jit
-    def _stage1(X, FRRE, FRIM, F1R, F1I, TWR, TWI, CRE, CIM, half,
+    def _mirror(FRRE, FRIM, XRE, XIM, half, BLOCK: tl.constexpr):
+        #expand the half spectrum into full mirrored planes, conjugated for
+        #the inverse fft trick. contiguous writes, so the inverse stage1 can
+        #load plainly instead of gathering through computed indices, which
+        #measured 15x slower than the plain load path
+        b = tl.program_id(0)
+        j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        sel = j <= half
+        idx = tl.where(sel, j, 65536 - j)
+        s = tl.where(sel, -1.0, 1.0)
+        ar = tl.load(FRRE + b * (half + 1) + idx)
+        ai = tl.load(FRIM + b * (half + 1) + idx) * s
+        tl.store(XRE + b * 65536 + j, ar)
+        tl.store(XIM + b * 65536 + j, ai)
+
+    @triton.jit
+    def _stage1(X, XRE, XIM, F1R, F1I, TWR, TWI, CRE, CIM,
                 IS_INV: tl.constexpr, PREC: tl.constexpr):
         #C[n2, k1] = (sum_n1 A[n2, n1] F[n1, k1]) * T[n2, k1]
-        #forward A is the real input, inverse A is the half spectrum with
-        #hermitian completion and the conj trick folded into the load sign
+        #forward A is the real input, inverse A is the mirrored conjugated
+        #spectrum the _mirror kernel prepared. C is stored transposed, k1
+        #major, so stage2 can load it without a register transpose
         b = tl.program_id(0)
         r2 = tl.program_id(1) * 32 + tl.arange(0, 32)
         rk = tl.program_id(2) * 128 + tl.arange(0, 128)
@@ -455,11 +482,8 @@ if HAVE_TRITON:
             fr = tl.load(F1R + rn[:, None] * 256 + rk[None, :])
             fi = tl.load(F1I + rn[:, None] * 256 + rk[None, :])
             if IS_INV:
-                sel = j <= half
-                idx = tl.where(sel, j, 65536 - j)
-                s = tl.where(sel, -1.0, 1.0)
-                ar = tl.load(FRRE + b * (half + 1) + idx)
-                ai = tl.load(FRIM + b * (half + 1) + idx) * s
+                ar = tl.load(XRE + b * 65536 + j)
+                ai = tl.load(XIM + b * 65536 + j)
                 accr += tl.dot(ar, fr, input_precision=PREC) - tl.dot(ai, fi, input_precision=PREC)
                 acci += tl.dot(ar, fi, input_precision=PREC) + tl.dot(ai, fr, input_precision=PREC)
             else:
@@ -468,15 +492,19 @@ if HAVE_TRITON:
                 acci += tl.dot(ar, fi, input_precision=PREC)
         twr = tl.load(TWR + r2[:, None] * 256 + rk[None, :])
         twi = tl.load(TWI + r2[:, None] * 256 + rk[None, :])
-        off = b * 65536 + r2[:, None] * 256 + rk[None, :]
+        #transposed store, element (n2, k1) lands at k1 * 256 + n2
+        off = b * 65536 + rk[None, :] * 256 + r2[:, None]
         tl.store(CRE + off, accr * twr - acci * twi)
         tl.store(CIM + off, accr * twi + acci * twr)
 
     @triton.jit
     def _stage2(CRE, CIM, F2R, F2I, DRE, DIM, XO, inv_scale,
                 IS_INV: tl.constexpr, PREC: tl.constexpr):
-        #D[k1, k2] = sum_n2 C[n2, k1] F[n2, k2], forward keeps the spectrum in
-        #matrix layout, inverse stores the real signal at k1 + 256 k2
+        #D[k1, k2] = sum_n2 C[n2, k1] F[n2, k2], forward keeps the spectrum
+        #in matrix layout, inverse stores the real signal at k1 + 256 k2.
+        #C arrives transposed from stage1, so the tile loads straight into
+        #the dot with no in loop transpose (the transpose measured 5x the
+        #cost of the whole forward stage1)
         b = tl.program_id(0)
         r1 = tl.program_id(1) * 32 + tl.arange(0, 32)
         rk = tl.program_id(2) * 128 + tl.arange(0, 128)
@@ -484,10 +512,8 @@ if HAVE_TRITON:
         acci = tl.zeros((32, 128), tl.float32)
         for n0 in range(0, 256, 64):
             rn = n0 + tl.arange(0, 64)
-            cr = tl.load(CRE + b * 65536 + rn[:, None] * 256 + r1[None, :])
-            ci = tl.load(CIM + b * 65536 + rn[:, None] * 256 + r1[None, :])
-            ar = tl.trans(cr)
-            ai = tl.trans(ci)
+            ar = tl.load(CRE + b * 65536 + r1[:, None] * 256 + rn[None, :])
+            ai = tl.load(CIM + b * 65536 + r1[:, None] * 256 + rn[None, :])
             fr = tl.load(F2R + rn[:, None] * 256 + rk[None, :])
             fi = tl.load(F2I + rn[:, None] * 256 + rk[None, :])
             accr += tl.dot(ar, fr, input_precision=PREC) - tl.dot(ai, fi, input_precision=PREC)
@@ -558,12 +584,18 @@ if HAVE_TRITON:
     def _block_two(DRE, DIM, FRRE, FRIM, KR, KI, PIDX, WRE, WIM,
                    F1R, F1I, TWR, TWI, F2R, F2I, GDV, POS, TASK,
                    n_d, n_fr, n_k, scale,
-                   N1: tl.constexpr, N2: tl.constexpr,
+                   N1: tl.constexpr, N2: tl.constexpr, SPLIT: tl.constexpr,
                    IS_FWD: tl.constexpr, PREC: tl.constexpr):
-        #two matmul stages per block, one program per bin, forward runs the
-        #inverse dft through the conj trick, inverse runs the forward dft
-        row = tl.program_id(0)
+        #two matmul stages per block, forward runs the inverse dft through
+        #the conj trick, inverse runs the forward dft. SPLIT programs share
+        #one bin, each computing a slice of the second stage's columns, the
+        #first stage is recomputed per slice (it is tiny). one program per
+        #bin gave 33 programs on 108 sms for the 2048 blocks, measured as
+        #the second worst kernel in the pipeline
+        pid = tl.program_id(0)
         b = tl.program_id(1)
+        row = pid // SPLIT
+        sp = pid % SPLIT
         t = TASK + row * 2
         ab = tl.load(t + 0)
         ob = tl.load(t + 1)
@@ -588,11 +620,13 @@ if HAVE_TRITON:
         ci = br * twi + bi * twr
         ar2 = tl.trans(cr)
         ai2 = tl.trans(ci)
-        f2r = tl.load(F2R + r2[:, None] * N2 + r2[None, :])
-        f2i = tl.load(F2I + r2[:, None] * N2 + r2[None, :])
+        #this program's slice of the output columns
+        rk2 = sp * (N2 // SPLIT) + tl.arange(0, N2 // SPLIT)
+        f2r = tl.load(F2R + r2[:, None] * N2 + rk2[None, :])
+        f2i = tl.load(F2I + r2[:, None] * N2 + rk2[None, :])
         dr = tl.dot(ar2, f2r, input_precision=PREC) - tl.dot(ai2, f2i, input_precision=PREC)
         di = tl.dot(ar2, f2i, input_precision=PREC) + tl.dot(ai2, f2r, input_precision=PREC)
-        oo = r1[:, None] + N1 * r2[None, :]
+        oo = r1[:, None] + N1 * rk2[None, :]
         if IS_FWD:
             tl.store(KR + b * n_k + ob + oo, dr * scale)
             tl.store(KI + b * n_k + ob + oo, -di * scale)
