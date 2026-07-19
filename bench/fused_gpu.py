@@ -166,6 +166,79 @@ def main():
     for (n1, v1), (_, v32) in zip(p1, p32):
         print(f"{n1:<16} | {v1:>8.3f} | {v32:>8.3f}")
 
+    #config sweep, brute measurement instead of one hypothesis per cluster
+    #round. tries tile shapes for the two worst stage kernels and split
+    #factors for the widest block bucket, applies the winners to everything
+    #below, so the bars table already runs with the best measured configs
+    print("\n== config sweep, fp32, median ms per launch ==")
+    CFGS = [
+        dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=2),
+        dict(BM=32, BN=64, BK=64, num_warps=4, num_stages=2),
+        dict(BM=64, BN=64, BK=64, num_warps=8, num_stages=2),
+        dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=1),
+        dict(BM=64, BN=128, BK=32, num_warps=8, num_stages=2),
+        dict(BM=32, BN=32, BK=64, num_warps=4, num_stages=2),
+        dict(BM=32, BN=128, BK=64, num_warps=16, num_stages=2),
+    ]
+    xs = {1: x, 32: torch.randn(32, SL, device=dev)}
+    f._workspace(32)
+    print(f"{'stage cfg':<24} | {'s1i_B1':>7} {'s2f_B1':>7} | {'s1i_B32':>8} {'s2f_B32':>8}")
+    print("-" * 64)
+    best1 = best2 = None
+    with torch.no_grad():
+        for c in CFGS:
+            label = f"BM{c['BM']} BN{c['BN']} BK{c['BK']} w{c['num_warps']} s{c['num_stages']}"
+            try:
+                f.s1i = dict(c)
+                f.s2f = dict(c)
+                p1 = dict(f.bench_parts(xs[1], reps=20))
+                p32 = dict(f.bench_parts(xs[32], reps=20))
+                v = (p1["inv stage1"], p1["fwd stage2"],
+                     p32["inv stage1"], p32["fwd stage2"])
+                print(f"{label:<24} | {v[0]:>7.3f} {v[1]:>7.3f} | {v[2]:>8.3f} {v[3]:>8.3f}")
+                s1 = v[0] + v[2] / 32
+                s2 = v[1] + v[3] / 32
+                if best1 is None or s1 < best1[0]:
+                    best1 = (s1, dict(c))
+                if best2 is None or s2 < best2[0]:
+                    best2 = (s2, dict(c))
+            except Exception as exc:
+                print(f"{label:<24} | SKIPPED {type(exc).__name__}: {str(exc)[:40]}")
+        f.s1i = best1[1]
+        f.s2f = best2[1]
+        c1, c2 = f.s1i, f.s2f
+        print(f"winners  s1i BM{c1['BM']} BN{c1['BN']} BK{c1['BK']} w{c1['num_warps']} "
+              f"s{c1['num_stages']}, s2f BM{c2['BM']} BN{c2['BN']} BK{c2['BK']} "
+              f"w{c2['num_warps']} s{c2['num_stages']}")
+
+        #split factors for the widest block bucket, fwd and inv apart
+        tb = [t for t in f.two if t["N2"] >= 64][0]
+        name = f"two {tb['N1']}x{tb['N2']}"
+        keep_bmax = f.split_bmax
+        f.split_bmax = 1 << 30
+        print(f"\n{'split':>5} | {'fwd_B1':>7} {'inv_B1':>7} | {'fwd_B32':>8} {'inv_B32':>8}")
+        print("-" * 46)
+        bestf = besti1 = besti32 = None
+        for s in (1, 2, 4, 8):
+            tb["split"] = s
+            tb["spliti"] = s
+            p1 = dict(f.bench_parts(xs[1], reps=20))
+            p32 = dict(f.bench_parts(xs[32], reps=20))
+            v = (p1["fwd " + name], p1["inv " + name],
+                 p32["fwd " + name], p32["inv " + name])
+            print(f"{s:>5} | {v[0]:>7.3f} {v[1]:>7.3f} | {v[2]:>8.3f} {v[3]:>8.3f}")
+            if bestf is None or v[0] + v[2] / 32 < bestf[0]:
+                bestf = (v[0] + v[2] / 32, s)
+            if besti1 is None or v[1] < besti1[0]:
+                besti1 = (v[1], s)
+            if besti32 is None or v[3] < besti32[0]:
+                besti32 = (v[3], s)
+        tb["split"] = bestf[1]
+        tb["spliti"] = besti1[1]
+        f.split_bmax = keep_bmax if besti32[1] == 1 else (1 << 30)
+        print(f"winners  fwd split {tb['split']}, inv split {tb['spliti']} "
+              f"(unsplit past batch {f.split_bmax if f.split_bmax < 1 << 30 else 'never'})")
+
     #peak memory before the batch loop fills the workspace cache, so the
     #number means one B 1 roundtrip and not the sum of every batch size
     torch.cuda.empty_cache()
