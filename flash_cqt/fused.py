@@ -176,6 +176,7 @@ class FusedOctCQT:
             self.two.append(dict(
                 N1=N1, N2=N2, scale=t["scale"],
                 split=4 if N2 >= 64 else 1, spliti=4 if N2 >= 64 else 1,
+                spliti_big=1,
                 F1R=t["F1R"], F1I=t["F1I"], F2R=t["F2R"], F2I=t["F2I"],
                 TWR=t["TWR"], TWI=t["TWI"],
                 pidx=cat(t["pidx"], torch.int32),
@@ -185,16 +186,57 @@ class FusedOctCQT:
                 pos=cat(t["pos"], torch.int32),
                 task=torch.tensor(t["rows"], dtype=torch.int32, device=dev)))
 
+        #colour the bands of each two stage bucket so no two bands in one
+        #class share a scatter bin, then the inverse runs one plain read add
+        #write launch per class instead of atomics. the inverse 2048 bucket
+        #measured 10x its forward twin under atomic contention. supports are
+        #contiguous and only neighbours overlap, so two classes suffice,
+        #the assert below proves it on every build
+        for t in self.two:
+            rows = t["task"].tolist()
+            M = t["N1"] * t["N2"]
+            spans = []
+            for ab, ob in rows:
+                g = t["gdv"][ab:ab + M]
+                pv = t["pos"][ab:ab + M][g != 0]
+                spans.append((int(pv.min()), int(pv.max())) if pv.numel() else (0, -1))
+            order = sorted(range(len(rows)), key=lambda i: spans[i][0])
+            ends = []
+            colour = [0] * len(rows)
+            for i in order:
+                lo, hi = spans[i]
+                for c in range(len(ends) + 1):
+                    if c == len(ends):
+                        ends.append(hi)
+                        colour[i] = c
+                    elif ends[c] < lo:
+                        ends[c] = hi
+                        colour[i] = c
+                    else:
+                        continue
+                    break
+            t["tasks_c"] = []
+            for c in range(len(ends)):
+                sel = [rows[i] for i in range(len(rows)) if colour[i] == c]
+                pu = torch.cat([t["pos"][ab:ab + M][t["gdv"][ab:ab + M] != 0]
+                                for ab, ob in sel])
+                assert pu.numel() == torch.unique(pu).numel(), "scatter collision in colour class"
+                t["tasks_c"].append(torch.tensor(sel, dtype=torch.int32, device=dev))
+
         self._ws = {}  #workspaces per batch size
 
-        #stage kernel launch configs, one per direction, the sweep in
-        #bench/fused_gpu.py overwrites these with measured winners
+        #stage kernel launch configs, per direction and per precision, the
+        #sweep in bench/fused_gpu.py overwrites them with measured winners.
+        #fp32 wants tiny tiles (register budget), tensor core modes want
+        #bigger ones, so they are tuned apart
         cfg = dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=2)
-        self.s1f, self.s1i = dict(cfg), dict(cfg)
-        self.s2f, self.s2i = dict(cfg), dict(cfg)
-        #inverse block splits contend on atomics at batch (measured, split 4
-        #was faster at B 1 and slower at B 32), past this batch size the
-        #inverse runs unsplit
+        precs = ("ieee", "tf32", "tf32x3")
+        self.s1f = {p: dict(cfg) for p in precs}
+        self.s1i = {p: dict(cfg) for p in precs}
+        self.s2f = {p: dict(cfg) for p in precs}
+        self.s2i = {p: dict(cfg) for p in precs}
+        #inverse block splits contend at batch (measured), below this batch
+        #size the inverse uses spliti, above it spliti_big
         self.split_bmax = 8
 
     def _workspace(self, B):
@@ -332,27 +374,30 @@ class FusedOctCQT:
         B = x.shape[0]
         w = self._workspace(B)
         prec = getattr(self, "prec", "ieee")
+        c1, c2 = self.s1f[prec], self.s2f[prec]
         #DR DI are passed to stage1 as the inverse input planes, unused in
         #the forward branch, any tensor of the right size does
-        _stage1[(B, R // self.s1f["BM"], R // self.s1f["BN"])](
+        _stage1[(B, R // c1["BM"], R // c1["BN"])](
             x, w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], IS_INV=False, PREC=prec, **self.s1f)
-        _stage2[(B, R // self.s2f["BM"], R // self.s2f["BN"])](
+            w["CR"], w["CI"], IS_INV=False, PREC=prec, **c1)
+        _stage2[(B, R // c2["BM"], R // c2["BN"])](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
-            1.0 / N, IS_INV=False, PREC=prec, **self.s2f)
+            1.0 / N, IS_INV=False, PREC=prec, **c2)
         _block_direct[(self.d_task.shape[0], B)](
             w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
             self.d_pidx, self.d_wre, self.d_wim, self.d_wir, self.d_wii,
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=True, PREC=prec, num_warps=4, num_stages=2)
         for t in self.two:
-            _block_two[(t["task"].shape[0] * t["split"], B)](
+            #dot widths must stay 16 or more, older triton enforces it
+            sp = max(1, min(t["split"], t["N2"] // 16))
+            _block_two[(t["task"].shape[0] * sp, B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=t["split"],
-                IS_FWD=True, PREC=prec, num_warps=4, num_stages=2)
+                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
+                ATOMIC=True, IS_FWD=True, PREC=prec, num_warps=4, num_stages=2)
         return w["KR"], w["KI"]
 
     def bwd(self, KR, KI):
@@ -367,24 +412,30 @@ class FusedOctCQT:
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=False, PREC=prec, num_warps=4, num_stages=2)
         for t in self.two:
-            sp = t["spliti"] if B < self.split_bmax else 1
-            _block_two[(t["task"].shape[0] * sp, B)](
-                w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
-                t["pidx"], t["wre"], t["wim"],
-                t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
-                t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
-                IS_FWD=False, PREC=prec, num_warps=4, num_stages=2)
+            sp = t["spliti"] if B < self.split_bmax else t["spliti_big"]
+            sp = max(1, min(sp, t["N2"] // 16))
+            #one launch per colour class, no two bands in a class share a
+            #bin, so plain read add write replaces the contended atomics
+            for tk in t["tasks_c"]:
+                _block_two[(tk.shape[0] * sp, B)](
+                    w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
+                    t["pidx"], t["wre"], t["wim"],
+                    t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
+                    t["gdv"], t["pos"], tk, N, HALF + 1, self.ncoef,
+                    t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
+                    ATOMIC=False, IS_FWD=False, PREC=prec,
+                    num_warps=4, num_stages=2)
         #expand the half spectrum into full conjugated planes so stage1
         #loads contiguously, DR DI are free in this direction
         _mirror[(B, N // 1024)](
             w["FR"], w["FI"], w["DR"], w["DI"], HALF, BLOCK=1024)
-        _stage1[(B, R // self.s1i["BM"], R // self.s1i["BN"])](
+        c1, c2 = self.s1i[prec], self.s2i[prec]
+        _stage1[(B, R // c1["BM"], R // c1["BN"])](
             w["XO"], w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], IS_INV=True, PREC=prec, **self.s1i)
-        _stage2[(B, R // self.s2i["BM"], R // self.s2i["BN"])](
+            w["CR"], w["CI"], IS_INV=True, PREC=prec, **c1)
+        _stage2[(B, R // c2["BM"], R // c2["BN"])](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
-            1.0 / N, IS_INV=True, PREC=prec, **self.s2i)
+            1.0 / N, IS_INV=True, PREC=prec, **c2)
         return w["XO"]
 
     def bench_parts(self, x, reps=50):
@@ -411,49 +462,58 @@ class FusedOctCQT:
             ts.sort()
             return ts[len(ts) // 2]
 
-        parts = [("fwd stage1", med(lambda: _stage1[(B, R // self.s1f["BM"], R // self.s1f["BN"])](
+        c1f, c2f = self.s1f[prec], self.s2f[prec]
+        c1i, c2i = self.s1i[prec], self.s2i[prec]
+        parts = [("fwd stage1", med(lambda: _stage1[(B, R // c1f["BM"], R // c1f["BN"])](
             x, w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], IS_INV=False, PREC=prec, **self.s1f)))]
-        parts.append(("fwd stage2", med(lambda: _stage2[(B, R // self.s2f["BM"], R // self.s2f["BN"])](
+            w["CR"], w["CI"], IS_INV=False, PREC=prec, **c1f)))]
+        parts.append(("fwd stage2", med(lambda: _stage2[(B, R // c2f["BM"], R // c2f["BN"])](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
-            1.0 / N, IS_INV=False, PREC=prec, **self.s2f))))
+            1.0 / N, IS_INV=False, PREC=prec, **c2f))))
         parts.append(("fwd direct", med(lambda: _block_direct[(self.d_task.shape[0], B)](
             w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
             self.d_pidx, self.d_wre, self.d_wim, self.d_wir, self.d_wii,
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=True, PREC=prec, num_warps=4, num_stages=2))))
         for t in self.two:
+            sp = max(1, min(t["split"], t["N2"] // 16))
             parts.append((f"fwd two {t['N1']}x{t['N2']}",
-                          med(lambda t=t: _block_two[(t["task"].shape[0] * t["split"], B)](
+                          med(lambda t=t, sp=sp: _block_two[(t["task"].shape[0] * sp, B)](
                 w["DR"], w["DI"], w["FR"], w["FI"], w["KR"], w["KI"],
                 t["pidx"], t["wre"], t["wim"],
                 t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
                 t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=t["split"],
-                IS_FWD=True, PREC=prec, num_warps=4, num_stages=2))))
+                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
+                ATOMIC=True, IS_FWD=True, PREC=prec, num_warps=4, num_stages=2))))
         parts.append(("inv direct", med(lambda: _block_direct[(self.d_task.shape[0], B)](
             w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
             self.d_pidx, self.d_wre, self.d_wim, self.d_fmr, self.d_fmi,
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=False, PREC=prec, num_warps=4, num_stages=2))))
         for t in self.two:
-            sp = t["spliti"] if B < self.split_bmax else 1
-            parts.append((f"inv two {t['N1']}x{t['N2']}",
-                          med(lambda t=t, sp=sp: _block_two[(t["task"].shape[0] * sp, B)](
-                w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
-                t["pidx"], t["wre"], t["wim"],
-                t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
-                t["gdv"], t["pos"], t["task"], N, HALF + 1, self.ncoef,
-                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
-                IS_FWD=False, PREC=prec, num_warps=4, num_stages=2))))
+            sp = t["spliti"] if B < self.split_bmax else t["spliti_big"]
+            sp = max(1, min(sp, t["N2"] // 16))
+
+            def run_inv(t=t, sp=sp):
+                for tk in t["tasks_c"]:
+                    _block_two[(tk.shape[0] * sp, B)](
+                        w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
+                        t["pidx"], t["wre"], t["wim"],
+                        t["F1R"], t["F1I"], t["TWR"], t["TWI"],
+                        t["F2R"], t["F2I"],
+                        t["gdv"], t["pos"], tk, N, HALF + 1, self.ncoef,
+                        t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
+                        ATOMIC=False, IS_FWD=False, PREC=prec,
+                        num_warps=4, num_stages=2)
+            parts.append((f"inv two {t['N1']}x{t['N2']}", med(run_inv)))
         parts.append(("inv mirror", med(lambda: _mirror[(B, N // 1024)](
             w["FR"], w["FI"], w["DR"], w["DI"], HALF, BLOCK=1024))))
-        parts.append(("inv stage1", med(lambda: _stage1[(B, R // self.s1i["BM"], R // self.s1i["BN"])](
+        parts.append(("inv stage1", med(lambda: _stage1[(B, R // c1i["BM"], R // c1i["BN"])](
             w["XO"], w["DR"], w["DI"], self.F1R, self.F1I, self.TWR, self.TWI,
-            w["CR"], w["CI"], IS_INV=True, PREC=prec, **self.s1i))))
-        parts.append(("inv stage2", med(lambda: _stage2[(B, R // self.s2i["BM"], R // self.s2i["BN"])](
+            w["CR"], w["CI"], IS_INV=True, PREC=prec, **c1i))))
+        parts.append(("inv stage2", med(lambda: _stage2[(B, R // c2i["BM"], R // c2i["BN"])](
             w["CR"], w["CI"], self.F1R, self.F1I, w["DR"], w["DI"], w["XO"],
-            1.0 / N, IS_INV=True, PREC=prec, **self.s2i))))
+            1.0 / N, IS_INV=True, PREC=prec, **c2i))))
         return parts
 
 
@@ -601,7 +661,7 @@ if HAVE_TRITON:
                    F1R, F1I, TWR, TWI, F2R, F2I, GDV, POS, TASK,
                    n_d, n_fr, n_k, scale,
                    N1: tl.constexpr, N2: tl.constexpr, SPLIT: tl.constexpr,
-                   IS_FWD: tl.constexpr, PREC: tl.constexpr):
+                   ATOMIC: tl.constexpr, IS_FWD: tl.constexpr, PREC: tl.constexpr):
         #two matmul stages per block, forward runs the inverse dft through
         #the conj trick, inverse runs the forward dft. SPLIT programs share
         #one bin, each computing a slice of the second stage's columns, the
@@ -649,5 +709,13 @@ if HAVE_TRITON:
         else:
             g = tl.load(GDV + ab + oo)
             p = tl.load(POS + ab + oo)
-            tl.atomic_add(FRRE + b * n_fr + p, dr * g)
-            tl.atomic_add(FRIM + b * n_fr + p, di * g)
+            if ATOMIC:
+                tl.atomic_add(FRRE + b * n_fr + p, dr * g)
+                tl.atomic_add(FRIM + b * n_fr + p, di * g)
+            else:
+                #the colour classes guarantee no other program touches these
+                #bins, plain read add write, no contention
+                vr = tl.load(FRRE + b * n_fr + p)
+                vi = tl.load(FRIM + b * n_fr + p)
+                tl.store(FRRE + b * n_fr + p, vr + dr * g)
+                tl.store(FRIM + b * n_fr + p, vi + di * g)

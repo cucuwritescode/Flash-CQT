@@ -170,7 +170,7 @@ def main():
     #round. tries tile shapes for the two worst stage kernels and split
     #factors for the widest block bucket, applies the winners to everything
     #below, so the bars table already runs with the best measured configs
-    print("\n== config sweep, fp32, median ms per launch ==")
+    print("\n== config sweep, worst stage kernels, median ms per launch ==")
     CFGS = [
         dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=2),
         dict(BM=32, BN=64, BK=64, num_warps=4, num_stages=2),
@@ -182,44 +182,56 @@ def main():
     ]
     xs = {1: x, 32: torch.randn(32, SL, device=dev)}
     f._workspace(32)
-    print(f"{'stage cfg':<24} | {'s1i_B1':>7} {'s2f_B1':>7} | {'s1i_B32':>8} {'s2f_B32':>8}")
-    print("-" * 64)
-    best1 = best2 = None
     with torch.no_grad():
-        for c in CFGS:
-            label = f"BM{c['BM']} BN{c['BN']} BK{c['BK']} w{c['num_warps']} s{c['num_stages']}"
-            try:
-                f.s1i = dict(c)
-                f.s2f = dict(c)
-                p1 = dict(f.bench_parts(xs[1], reps=20))
-                p32 = dict(f.bench_parts(xs[32], reps=20))
-                v = (p1["inv stage1"], p1["fwd stage2"],
-                     p32["inv stage1"], p32["fwd stage2"])
-                print(f"{label:<24} | {v[0]:>7.3f} {v[1]:>7.3f} | {v[2]:>8.3f} {v[3]:>8.3f}")
-                s1 = v[0] + v[2] / 32
-                s2 = v[1] + v[3] / 32
-                if best1 is None or s1 < best1[0]:
-                    best1 = (s1, dict(c))
-                if best2 is None or s2 < best2[0]:
-                    best2 = (s2, dict(c))
-            except Exception as exc:
-                print(f"{label:<24} | SKIPPED {type(exc).__name__}: {str(exc)[:40]}")
-        f.s1i = best1[1]
-        f.s2f = best2[1]
-        c1, c2 = f.s1i, f.s2f
-        print(f"winners  s1i BM{c1['BM']} BN{c1['BN']} BK{c1['BK']} w{c1['num_warps']} "
-              f"s{c1['num_stages']}, s2f BM{c2['BM']} BN{c2['BN']} BK{c2['BK']} "
-              f"w{c2['num_warps']} s{c2['num_stages']}")
+        #fp32 wants tiny tiles for the register budget, tensor core modes
+        #want fatter ones to feed the mma units, tune them apart
+        for prec in ("ieee", "tf32x3"):
+            f.prec = prec
+            print(f"[{prec}]")
+            print(f"{'stage cfg':<24} | {'s1i_B1':>7} {'s2f_B1':>7} | {'s1i_B32':>8} {'s2f_B32':>8}")
+            print("-" * 64)
+            best1 = best2 = None
+            for c in CFGS:
+                label = f"BM{c['BM']} BN{c['BN']} BK{c['BK']} w{c['num_warps']} s{c['num_stages']}"
+                try:
+                    f.s1i[prec] = dict(c)
+                    f.s2f[prec] = dict(c)
+                    p1 = dict(f.bench_parts(xs[1], reps=20))
+                    p32 = dict(f.bench_parts(xs[32], reps=20))
+                    v = (p1["inv stage1"], p1["fwd stage2"],
+                         p32["inv stage1"], p32["fwd stage2"])
+                    print(f"{label:<24} | {v[0]:>7.3f} {v[1]:>7.3f} | {v[2]:>8.3f} {v[3]:>8.3f}")
+                    s1 = v[0] + v[2] / 32
+                    s2 = v[1] + v[3] / 32
+                    if best1 is None or s1 < best1[0]:
+                        best1 = (s1, dict(c))
+                    if best2 is None or s2 < best2[0]:
+                        best2 = (s2, dict(c))
+                except Exception as exc:
+                    print(f"{label:<24} | SKIPPED {type(exc).__name__}: {str(exc)[:40]}")
+            f.s1i[prec] = best1[1]
+            f.s2f[prec] = best2[1]
+            if prec == "tf32x3":
+                #plain tf32 shares the tensor core shape
+                f.s1i["tf32"] = dict(best1[1])
+                f.s2f["tf32"] = dict(best2[1])
+            c1, c2 = best1[1], best2[1]
+            print(f"winners  s1i BM{c1['BM']} BN{c1['BN']} BK{c1['BK']} w{c1['num_warps']} "
+                  f"s{c1['num_stages']}, s2f BM{c2['BM']} BN{c2['BN']} BK{c2['BK']} "
+                  f"w{c2['num_warps']} s{c2['num_stages']}")
+        f.prec = "ieee"
 
-        #split factors for the widest block bucket, fwd and inv apart
+        #split factors for the widest block bucket, fp32, fwd and inv apart.
+        #splits past N2 over 16 would push the dot width under triton's
+        #minimum of 16, they are not offered
         tb = [t for t in f.two if t["N2"] >= 64][0]
         name = f"two {tb['N1']}x{tb['N2']}"
         keep_bmax = f.split_bmax
-        f.split_bmax = 1 << 30
+        f.split_bmax = 1 << 30  #so the B 32 rows exercise the small batch split
         print(f"\n{'split':>5} | {'fwd_B1':>7} {'inv_B1':>7} | {'fwd_B32':>8} {'inv_B32':>8}")
         print("-" * 46)
         bestf = besti1 = besti32 = None
-        for s in (1, 2, 4, 8):
+        for s in (1, 2, 4):
             tb["split"] = s
             tb["spliti"] = s
             p1 = dict(f.bench_parts(xs[1], reps=20))
@@ -235,9 +247,10 @@ def main():
                 besti32 = (v[3], s)
         tb["split"] = bestf[1]
         tb["spliti"] = besti1[1]
-        f.split_bmax = keep_bmax if besti32[1] == 1 else (1 << 30)
-        print(f"winners  fwd split {tb['split']}, inv split {tb['spliti']} "
-              f"(unsplit past batch {f.split_bmax if f.split_bmax < 1 << 30 else 'never'})")
+        tb["spliti_big"] = besti32[1]
+        f.split_bmax = keep_bmax
+        print(f"winners  fwd split {tb['split']}, inv split {tb['spliti']} below "
+              f"batch {f.split_bmax}, {tb['spliti_big']} above")
 
     #peak memory before the batch loop fills the workspace cache, so the
     #number means one B 1 roundtrip and not the sum of every batch size
