@@ -221,36 +221,47 @@ def main():
                   f"w{c2['num_warps']} s{c2['num_stages']}")
         f.prec = "ieee"
 
-        #split factors for the widest block bucket, fp32, fwd and inv apart.
-        #splits past N2 over 16 would push the dot width under triton's
-        #minimum of 16, they are not offered
+        #forward split for the widest bucket, fp32. splits past N2 over 16
+        #would push the dot width under triton's minimum, not offered
         tb = [t for t in f.two if t["N2"] >= 64][0]
         name = f"two {tb['N1']}x{tb['N2']}"
-        keep_bmax = f.split_bmax
-        f.split_bmax = 1 << 30  #so the B 32 rows exercise the small batch split
-        print(f"\n{'split':>5} | {'fwd_B1':>7} {'inv_B1':>7} | {'fwd_B32':>8} {'inv_B32':>8}")
-        print("-" * 46)
-        bestf = besti1 = besti32 = None
+        print(f"\n{'fwd split':>9} | {'fwd_B1':>7} {'fwd_B32':>8}")
+        print("-" * 30)
+        bestf = None
         for s in (1, 2, 4):
             tb["split"] = s
-            tb["spliti"] = s
             p1 = dict(f.bench_parts(xs[1], reps=20))
             p32 = dict(f.bench_parts(xs[32], reps=20))
-            v = (p1["fwd " + name], p1["inv " + name],
-                 p32["fwd " + name], p32["inv " + name])
-            print(f"{s:>5} | {v[0]:>7.3f} {v[1]:>7.3f} | {v[2]:>8.3f} {v[3]:>8.3f}")
-            if bestf is None or v[0] + v[2] / 32 < bestf[0]:
-                bestf = (v[0] + v[2] / 32, s)
-            if besti1 is None or v[1] < besti1[0]:
-                besti1 = (v[1], s)
-            if besti32 is None or v[3] < besti32[0]:
-                besti32 = (v[3], s)
+            v = (p1["fwd " + name], p32["fwd " + name])
+            print(f"{s:>9} | {v[0]:>7.3f} {v[1]:>8.3f}")
+            if bestf is None or v[0] + v[1] / 32 < bestf[0]:
+                bestf = (v[0] + v[1] / 32, s)
         tb["split"] = bestf[1]
-        tb["spliti"] = besti1[1]
-        tb["spliti_big"] = besti32[1]
-        f.split_bmax = keep_bmax
-        print(f"winners  fwd split {tb['split']}, inv split {tb['spliti']} below "
-              f"batch {f.split_bmax}, {tb['spliti_big']} above")
+
+        #inverse scatter, atomic against coloured classes, by split, both
+        #batch regimes. the cards disagree here (sm70 fp32 atomics are slow,
+        #sm80 ones are fine), so it is measured, not assumed
+        print(f"\n{'inv mode':>8} {'split':>5} | {'inv_B1':>7} {'inv_B32':>8}")
+        print("-" * 36)
+        best1 = best32 = None
+        for atomic in (True, False):
+            for s in (1, 2, 4):
+                tb["spliti"] = tb["spliti_big"] = s
+                tb["inv_atomic"] = tb["inv_atomic_big"] = atomic
+                p1 = dict(f.bench_parts(xs[1], reps=20))
+                p32 = dict(f.bench_parts(xs[32], reps=20))
+                v = (p1["inv " + name], p32["inv " + name])
+                lab = "atomic" if atomic else "colour"
+                print(f"{lab:>8} {s:>5} | {v[0]:>7.3f} {v[1]:>8.3f}")
+                if best1 is None or v[0] < best1[0]:
+                    best1 = (v[0], atomic, s)
+                if best32 is None or v[1] < best32[0]:
+                    best32 = (v[1], atomic, s)
+        tb["inv_atomic"], tb["spliti"] = best1[1], best1[2]
+        tb["inv_atomic_big"], tb["spliti_big"] = best32[1], best32[2]
+        print(f"winners  fwd split {tb['split']}, inv "
+              f"{'atomic' if best1[1] else 'colour'} split {best1[2]} small batch, "
+              f"{'atomic' if best32[1] else 'colour'} split {best32[2]} large")
 
     #peak memory before the batch loop fills the workspace cache, so the
     #number means one B 1 roundtrip and not the sum of every batch size

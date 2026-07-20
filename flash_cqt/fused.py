@@ -176,7 +176,7 @@ class FusedOctCQT:
             self.two.append(dict(
                 N1=N1, N2=N2, scale=t["scale"],
                 split=4 if N2 >= 64 else 1, spliti=4 if N2 >= 64 else 1,
-                spliti_big=1,
+                spliti_big=1, inv_atomic=False, inv_atomic_big=False,
                 F1R=t["F1R"], F1I=t["F1I"], F2R=t["F2R"], F2I=t["F2I"],
                 TWR=t["TWR"], TWI=t["TWI"],
                 pidx=cat(t["pidx"], torch.int32),
@@ -238,6 +238,43 @@ class FusedOctCQT:
         #inverse block splits contend at batch (measured), below this batch
         #size the inverse uses spliti, above it spliti_big
         self.split_bmax = 8
+
+        #measured winners from the cluster sweeps baked in per architecture
+        #so the kernel is fast out of the box, the bench sweep still
+        #overrides whatever it measures better on the day
+        if self.dev.type == "cuda" and torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability(self.dev)
+            small = dict(BM=32, BN=32, BK=64, num_warps=4, num_stages=2)
+            if cap >= (8, 0):
+                #a100 sweep winners, fp32 wants tiny tiles, tf32x3 fat ones
+                self.s1i["ieee"] = dict(small)
+                self.s2f["ieee"] = dict(small)
+                self.s1i["tf32x3"] = dict(BM=32, BN=128, BK=64,
+                                          num_warps=8, num_stages=1)
+                self.s2f["tf32x3"] = dict(BM=32, BN=64, BK=64,
+                                          num_warps=4, num_stages=2)
+                self.s1i["tf32"] = dict(self.s1i["tf32x3"])
+                self.s2f["tf32"] = dict(self.s2f["tf32x3"])
+                for t in self.two:
+                    if t["N2"] >= 64:
+                        #atomics measured faster than colour classes at B 1
+                        #on sm80, colour split 2 slightly ahead at batch
+                        t["spliti"], t["inv_atomic"] = 4, True
+                        t["spliti_big"], t["inv_atomic_big"] = 2, False
+                    else:
+                        t["inv_atomic"] = t["inv_atomic_big"] = False
+            else:
+                #v100 sweep winners, fp32 atomics are slow on sm70 so the
+                #coloured classes win everywhere on the wide bucket
+                self.s1i["ieee"] = dict(small)
+                self.s2f["ieee"] = dict(BM=64, BN=128, BK=32,
+                                        num_warps=8, num_stages=2)
+                for t in self.two:
+                    if t["N2"] >= 64:
+                        t["spliti"] = t["spliti_big"] = 4
+                        t["inv_atomic"] = t["inv_atomic_big"] = False
+                    else:
+                        t["inv_atomic"] = t["inv_atomic_big"] = True
 
     def _workspace(self, B):
         if B not in self._ws:
@@ -400,6 +437,26 @@ class FusedOctCQT:
                 ATOMIC=True, IS_FWD=True, PREC=prec, num_warps=4, num_stages=2)
         return w["KR"], w["KI"]
 
+    def _inv_two(self, t, B, w, KR, KI, prec):
+        #inverse scatter for one bucket. atomic mode is one launch over all
+        #bands, coloured mode is one launch per collision free class with
+        #plain read add write. which wins depends on the card (sm70 fp32
+        #atomics are slow, sm80 ones are fine), so it is a measured flag
+        big = B >= self.split_bmax
+        sp = t["spliti_big"] if big else t["spliti"]
+        sp = max(1, min(sp, t["N2"] // 16))
+        atomic = t["inv_atomic_big"] if big else t["inv_atomic"]
+        tasks = [t["task"]] if atomic else t["tasks_c"]
+        for tk in tasks:
+            _block_two[(tk.shape[0] * sp, B)](
+                w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
+                t["pidx"], t["wre"], t["wim"],
+                t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
+                t["gdv"], t["pos"], tk, N, HALF + 1, self.ncoef,
+                t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
+                ATOMIC=atomic, IS_FWD=False, PREC=prec,
+                num_warps=4, num_stages=2)
+
     def bwd(self, KR, KI):
         B = KR.shape[0]
         w = self._workspace(B)
@@ -412,19 +469,7 @@ class FusedOctCQT:
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=False, PREC=prec, num_warps=4, num_stages=2)
         for t in self.two:
-            sp = t["spliti"] if B < self.split_bmax else t["spliti_big"]
-            sp = max(1, min(sp, t["N2"] // 16))
-            #one launch per colour class, no two bands in a class share a
-            #bin, so plain read add write replaces the contended atomics
-            for tk in t["tasks_c"]:
-                _block_two[(tk.shape[0] * sp, B)](
-                    w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
-                    t["pidx"], t["wre"], t["wim"],
-                    t["F1R"], t["F1I"], t["TWR"], t["TWI"], t["F2R"], t["F2I"],
-                    t["gdv"], t["pos"], tk, N, HALF + 1, self.ncoef,
-                    t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
-                    ATOMIC=False, IS_FWD=False, PREC=prec,
-                    num_warps=4, num_stages=2)
+            self._inv_two(t, B, w, KR, KI, prec)
         #expand the half spectrum into full conjugated planes so stage1
         #loads contiguously, DR DI are free in this direction
         _mirror[(B, N // 1024)](
@@ -491,21 +536,8 @@ class FusedOctCQT:
             self.d_gdv, self.d_pos, self.d_task, N, HALF + 1, self.ncoef,
             IS_FWD=False, PREC=prec, num_warps=4, num_stages=2))))
         for t in self.two:
-            sp = t["spliti"] if B < self.split_bmax else t["spliti_big"]
-            sp = max(1, min(sp, t["N2"] // 16))
-
-            def run_inv(t=t, sp=sp):
-                for tk in t["tasks_c"]:
-                    _block_two[(tk.shape[0] * sp, B)](
-                        w["DR"], w["DI"], w["FR"], w["FI"], KR, KI,
-                        t["pidx"], t["wre"], t["wim"],
-                        t["F1R"], t["F1I"], t["TWR"], t["TWI"],
-                        t["F2R"], t["F2I"],
-                        t["gdv"], t["pos"], tk, N, HALF + 1, self.ncoef,
-                        t["scale"], N1=t["N1"], N2=t["N2"], SPLIT=sp,
-                        ATOMIC=False, IS_FWD=False, PREC=prec,
-                        num_warps=4, num_stages=2)
-            parts.append((f"inv two {t['N1']}x{t['N2']}", med(run_inv)))
+            parts.append((f"inv two {t['N1']}x{t['N2']}",
+                          med(lambda t=t: self._inv_two(t, B, w, KR, KI, prec))))
         parts.append(("inv mirror", med(lambda: _mirror[(B, N // 1024)](
             w["FR"], w["FI"], w["DR"], w["DI"], HALF, BLOCK=1024))))
         parts.append(("inv stage1", med(lambda: _stage1[(B, R // c1i["BM"], R // c1i["BN"])](
