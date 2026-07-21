@@ -257,9 +257,12 @@ class FusedOctCQT:
                 self.s2f["tf32"] = dict(self.s2f["tf32x3"])
                 for t in self.two:
                     if t["N2"] >= 64:
-                        #atomics measured faster than colour classes at B 1
-                        #on sm80, colour split 2 slightly ahead at batch
-                        t["spliti"], t["inv_atomic"] = 4, True
+                        #the round five graphed bars (the best measured end
+                        #to end, 0.294 ms tf32x3 at B 1) ran coloured
+                        #classes, split 4 small batch and 2 large. eager
+                        #rankings preferred atomics but the graphed
+                        #roundtrip did not, bake what actually won
+                        t["spliti"], t["inv_atomic"] = 4, False
                         t["spliti_big"], t["inv_atomic_big"] = 2, False
                     else:
                         t["inv_atomic"] = t["inv_atomic_big"] = False
@@ -269,6 +272,11 @@ class FusedOctCQT:
                 self.s1i["ieee"] = dict(small)
                 self.s2f["ieee"] = dict(BM=64, BN=128, BK=32,
                                         num_warps=8, num_stages=2)
+                #no tensor cores here, every precision runs the same machine
+                #code, share the winners rather than leave the generic tiles
+                for p in ("tf32", "tf32x3"):
+                    self.s1i[p] = dict(self.s1i["ieee"])
+                    self.s2f[p] = dict(self.s2f["ieee"])
                 for t in self.two:
                     if t["N2"] >= 64:
                         t["spliti"] = t["spliti_big"] = 4

@@ -166,23 +166,28 @@ def main():
     for (n1, v1), (_, v32) in zip(p1, p32):
         print(f"{n1:<16} | {v1:>8.3f} | {v32:>8.3f}")
 
-    #config sweep, brute measurement instead of one hypothesis per cluster
-    #round. tries tile shapes for the two worst stage kernels and split
-    #factors for the widest block bucket, applies the winners to everything
-    #below, so the bars table already runs with the best measured configs
-    print("\n== config sweep, worst stage kernels, median ms per launch ==")
-    CFGS = [
-        dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=2),
-        dict(BM=32, BN=64, BK=64, num_warps=4, num_stages=2),
-        dict(BM=64, BN=64, BK=64, num_warps=8, num_stages=2),
-        dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=1),
-        dict(BM=64, BN=128, BK=32, num_warps=8, num_stages=2),
-        dict(BM=32, BN=32, BK=64, num_warps=4, num_stages=2),
-        dict(BM=32, BN=128, BK=64, num_warps=16, num_stages=2),
-    ]
+    #config sweep and playoff, opt in with --sweep. the baked per
+    #architecture defaults already carry the best measured configs, the
+    #default run tests structural changes against that stable baseline
+    #instead of re tuning the world every round
     xs = {1: x, 32: torch.randn(32, SL, device=dev)}
     f._workspace(32)
-    with torch.no_grad():
+    if "--sweep" not in sys.argv:
+        print("\n(config sweep skipped, baked defaults in use, pass --sweep to re tune)")
+        run_sweep = False
+    else:
+        run_sweep = True
+    if run_sweep:
+        print("\n== config sweep, worst stage kernels, median ms per launch ==")
+        CFGS = [
+            dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=2),
+            dict(BM=32, BN=64, BK=64, num_warps=4, num_stages=2),
+            dict(BM=64, BN=64, BK=64, num_warps=8, num_stages=2),
+            dict(BM=32, BN=128, BK=64, num_warps=8, num_stages=1),
+            dict(BM=64, BN=128, BK=32, num_warps=8, num_stages=2),
+            dict(BM=32, BN=32, BK=64, num_warps=4, num_stages=2),
+            dict(BM=32, BN=128, BK=64, num_warps=16, num_stages=2),
+        ]
         #fp32 wants tiny tiles for the register budget, tensor core modes
         #want fatter ones to feed the mma units, tune them apart
         for prec in ("ieee", "tf32x3"):
@@ -262,6 +267,37 @@ def main():
         print(f"winners  fwd split {tb['split']}, inv "
               f"{'atomic' if best1[1] else 'colour'} split {best1[2]} small batch, "
               f"{'atomic' if best32[1] else 'colour'} split {best32[2]} large")
+
+        #playoff. the sweep above ranks eagerly, where every launch costs
+        #tens of us, but the deliverable is a captured graph where launches
+        #are nearly free, and the two rankings disagreed in round six (eager
+        #picked atomic, the graphed roundtrip was 0.1 ms faster with
+        #colour). so the final scatter choice is made on the graphed
+        #roundtrip in tf32x3, the headline mode
+        print("\n== scatter playoff, graphed tf32x3 roundtrip ==")
+        f.prec = "tf32x3"
+        print(f"{'mode':>7} {'split':>5} | {'B1_ms':>7} {'B32_ms':>8}")
+        print("-" * 36)
+        bp1 = bp32 = None
+        for a in (True, False):
+            for s in (2, 4):
+                tb["inv_atomic"] = tb["inv_atomic_big"] = a
+                tb["spliti"] = tb["spliti_big"] = s
+                g1 = capture(lambda: f.bwd(*f.fwd(xs[1])))
+                v1 = ev_ms(g1.replay, 30)
+                g32 = capture(lambda: f.bwd(*f.fwd(xs[32])))
+                v32 = ev_ms(g32.replay, 30)
+                lab = "atomic" if a else "colour"
+                print(f"{lab:>7} {s:>5} | {v1:>7.3f} {v32:>8.3f}")
+                if bp1 is None or v1 < bp1[0]:
+                    bp1 = (v1, a, s)
+                if bp32 is None or v32 < bp32[0]:
+                    bp32 = (v32, a, s)
+        tb["inv_atomic"], tb["spliti"] = bp1[1], bp1[2]
+        tb["inv_atomic_big"], tb["spliti_big"] = bp32[1], bp32[2]
+        f.prec = "ieee"
+        print(f"winners  {'atomic' if bp1[1] else 'colour'} split {bp1[2]} small batch, "
+              f"{'atomic' if bp32[1] else 'colour'} split {bp32[2]} large")
 
     #peak memory before the batch loop fills the workspace cache, so the
     #number means one B 1 roundtrip and not the sum of every batch size
