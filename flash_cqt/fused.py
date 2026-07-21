@@ -693,8 +693,11 @@ if HAVE_TRITON:
         else:
             g = tl.load(GDV + pb + eoff, mask=m2, other=0.0)
             p = tl.load(POS + pb + eoff, mask=m2, other=0)
-            tl.atomic_add(FRRE + b * n_fr + p, accr * g, mask=m2)
-            tl.atomic_add(FRIM + b * n_fr + p, acci * g, mask=m2)
+            #lanes in the window gap carry g 0 and pos 0, unmasked they all
+            #hit bin 0 together and serialise, mask them out entirely
+            m3 = m2 & (g != 0.0)
+            tl.atomic_add(FRRE + b * n_fr + p, accr * g, mask=m3)
+            tl.atomic_add(FRIM + b * n_fr + p, acci * g, mask=m3)
 
     @triton.jit
     def _block_two(DRE, DIM, FRRE, FRIM, KR, KI, PIDX, WRE, WIM,
@@ -749,13 +752,19 @@ if HAVE_TRITON:
         else:
             g = tl.load(GDV + ab + oo)
             p = tl.load(POS + ab + oo)
+            #lanes in the window gap carry g 0 and pos 0. unmasked, every
+            #such lane in every program does its memory op on bin 0, the
+            #same address across the whole launch, which serialises at the
+            #cache and grows with batch. for the 2048 blocks the gap is up
+            #to half the tile. mask them out, they contribute nothing
+            gm = g != 0.0
             if ATOMIC:
-                tl.atomic_add(FRRE + b * n_fr + p, dr * g)
-                tl.atomic_add(FRIM + b * n_fr + p, di * g)
+                tl.atomic_add(FRRE + b * n_fr + p, dr * g, mask=gm)
+                tl.atomic_add(FRIM + b * n_fr + p, di * g, mask=gm)
             else:
                 #the colour classes guarantee no other program touches these
                 #bins, plain read add write, no contention
-                vr = tl.load(FRRE + b * n_fr + p)
-                vi = tl.load(FRIM + b * n_fr + p)
-                tl.store(FRRE + b * n_fr + p, vr + dr * g)
-                tl.store(FRIM + b * n_fr + p, vi + di * g)
+                vr = tl.load(FRRE + b * n_fr + p, mask=gm, other=0.0)
+                vi = tl.load(FRIM + b * n_fr + p, mask=gm, other=0.0)
+                tl.store(FRRE + b * n_fr + p, vr + dr * g, mask=gm)
+                tl.store(FRIM + b * n_fr + p, vi + di * g, mask=gm)
