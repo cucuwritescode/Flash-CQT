@@ -154,17 +154,22 @@ def main():
                 print(f"{prec:<8} | SKIPPED {type(exc).__name__}: {str(exc)[:70]}")
     f.prec = "ieee"
 
-    #which kernel eats the time, medians per launch
-    print("\n== per kernel breakdown, fp32 ==")
+    #which kernel eats the time, graph replayed medians, and an a b of the
+    #cuda block kernels against the triton ones on the same honest clock
+    print("\n== per kernel breakdown, graphed medians, fp32 ==")
     with torch.no_grad():
-        p1 = f.bench_parts(x)
         x32 = torch.randn(32, SL, device=dev)
         f._workspace(32)
-        p32 = f.bench_parts(x32)
-    print(f"{'kernel':<16} | {'B1_ms':>8} | {'B32_ms':>8}")
-    print("-" * 40)
-    for (n1, v1), (_, v32) in zip(p1, p32):
-        print(f"{n1:<16} | {v1:>8.3f} | {v32:>8.3f}")
+        rows = {}
+        for flag in (True, False):
+            f.use_cuda_blocks = flag
+            rows[flag] = (dict(f.bench_parts(x)), dict(f.bench_parts(x32)))
+        f.use_cuda_blocks = True
+    print(f"{'kernel':<16} | {'cuda_B1':>8} {'tri_B1':>8} | {'cuda_B32':>9} {'tri_B32':>8}")
+    print("-" * 60)
+    for name in rows[True][0]:
+        print(f"{name:<16} | {rows[True][0][name]:>8.3f} {rows[False][0][name]:>8.3f} | "
+              f"{rows[True][1][name]:>9.3f} {rows[False][1][name]:>8.3f}")
 
     #config sweep and playoff, opt in with --sweep. the baked per
     #architecture defaults already carry the best measured configs, the
@@ -309,11 +314,14 @@ def main():
     print(f"\npeak cuda memory at B 1 (plus the B 32 workspace above)  "
           f"{torch.cuda.max_memory_allocated() / 1e6:.1f} MB")
 
-    #the bars, fp32 and the tensor core mode that held 117 db side by side
+    #the bars, fp32 and the tensor core mode side by side. the snr column
+    #gates every batch size, the stage path switches to cublas past a
+    #batch threshold and must stay exact there too
     print("\n== against the cufft baseline, graphed, per slice ==")
-    print(f"{'B':>4} | {'cufft_ms':>9} | {'fp32_ms':>9} {'speedup':>7} | "
-          f"{'tf32x3_ms':>9} {'speedup':>7}")
-    print("-" * 62)
+    print(f"{'B':>4} | {'cufft_ms':>9} | {'fp32_ms':>9} {'speedup':>7} {'snr':>6} | "
+          f"{'tf32x3_ms':>9} {'speedup':>7} {'snr':>6}")
+    print("-" * 78)
+    warns = []
     with torch.no_grad():
         for B in (1, 8, 32, 128):
             xb = torch.randn(B, SL, device=dev)
@@ -324,17 +332,36 @@ def main():
             a = ev_ms(g.replay)
             f._workspace(B)
             f.prec = "ieee"
+            xe = f.bwd(*f.fwd(xb))
+            vb = snr_db(xb, xe)
+            xe = xe.clone()
             g = capture(lambda: f.bwd(*f.fwd(xb)))
             b_ = ev_ms(g.replay)
+            #replay must reproduce the eager output, a kernel that misses
+            #the capture stream silently drops out of the graph and the
+            #replay runs a partial pipeline, fast and wrong
+            vg = snr_db(xe, f._workspace(B)["XO"])
+            if vg < 90:
+                warns.append(f"B {B} fp32 replay diverges from eager "
+                             f"({vg:.1f} db), graph timings invalid")
             try:
                 f.prec = "tf32x3"
+                xc = f.bwd(*f.fwd(xb))
+                vc = snr_db(xb, xc)
+                xc = xc.clone()
                 g = capture(lambda: f.bwd(*f.fwd(xb)))
                 c_ = ev_ms(g.replay)
-                tail = f"{c_:>9.3f} {a / c_:>6.2f}x"
+                vgc = snr_db(xc, f._workspace(B)["XO"])
+                if vgc < 90:
+                    warns.append(f"B {B} tf32x3 replay diverges from eager "
+                                 f"({vgc:.1f} db), graph timings invalid")
+                tail = f"{c_:>9.3f} {a / c_:>6.2f}x {vc:>6.1f}"
             except Exception as exc:
                 tail = f"SKIPPED {type(exc).__name__}"
             f.prec = "ieee"
-            print(f"{B:>4} | {a:>9.3f} | {b_:>9.3f} {a / b_:>6.2f}x | {tail}")
+            print(f"{B:>4} | {a:>9.3f} | {b_:>9.3f} {a / b_:>6.2f}x {vb:>6.1f} | {tail}")
+    for wmsg in warns:
+        print("WARNING", wmsg)
 
     if "ieee" in results:
         v, gm = results["ieee"]
