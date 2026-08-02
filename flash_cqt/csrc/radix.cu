@@ -90,8 +90,32 @@ void inv_bands(torch::Tensor kr, torch::Tensor ki,
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "inv_bands launch failed");
 }
 
+void adj_bands(torch::Tensor kr, torch::Tensor ki,
+               torch::Tensor fr, torch::Tensor fi,
+               torch::Tensor agr, torch::Tensor agi, torch::Tensor aidx,
+               torch::Tensor desc, torch::Tensor rr, torch::Tensor ri,
+               int64_t n_k, int64_t batch)
+{
+    //adjoint of the analysis, the band dft of the incoming coefficient
+    //gradients scattered at the analysis gather indices, two gain
+    //planes carry the conj sign, constants baked at table build
+    RP p = pack(desc, rr, ri, n_k);
+    p.kr = kr.data_ptr<float>();
+    p.ki = ki.data_ptr<float>();
+    p.fr = fr.data_ptr<float>();
+    p.fi = fi.data_ptr<float>();
+    p.gdv = agr.data_ptr<float>();
+    p.gdi = agi.data_ptr<float>();
+    p.pos = aidx.data_ptr<int>();
+    dim3 grid(desc.size(0), (unsigned)batch);
+    const int shmem = (2 * 2048 + 64) * (int)sizeof(float);
+    radix_kernel<3><<<grid, TPB, shmem, at::cuda::getCurrentCUDAStream()>>>(p);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "adj_bands launch failed");
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("fwd_bands", &fwd_bands, "router prologue plus mixed radix band idft");
     m.def("inv_bands", &inv_bands, "mixed radix band dft plus atomic scatter");
+    m.def("adj_bands", &adj_bands, "analysis adjoint, band dft plus signed scatter");
 }

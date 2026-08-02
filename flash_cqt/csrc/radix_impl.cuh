@@ -13,6 +13,7 @@ struct RP {
     const uint4* route;                 //16 byte taps, load order per band
     float* fr; float* fi;               //half spectrum planes [b, 32769]
     const float* gdv; const int* pos;   //dual window and scatter positions
+    const float* gdi;                   //imaginary gain, adjoint mode only
     const float* rr; const float* ri;   //per length roots, synthesis sign
     const int* desc;                    //rows of m, ab, ob, ro
     long n_k;
@@ -105,6 +106,16 @@ __device__ inline void put(const RP& p, int b, int ab, int ob, int k,
         const long kb = (long)b * p.n_k;
         p.kr[kb + ob + k] = vr * s;
         p.ki[kb + ob + k] = vi * s;
+    } else if (MODE == 3) {
+        //adjoint of the analysis, separate gains per plane carry the
+        //conj sign, every constant baked into the tables at build
+        const float g = p.gdv[ab + j];
+        if (g != 0.0f) {
+            const long fb = (long)b * (RX_LL + 1);
+            const int pp = p.pos[ab + j];
+            atomicAdd(p.fr + fb + pp, vr * g);
+            atomicAdd(p.fi + fb + pp, vi * p.gdi[ab + j]);
+        }
     } else {
         const float g = p.gdv[ab + j];
         if (g != 0.0f) {
@@ -175,7 +186,7 @@ __device__ void band_two(const RP& p, int b, int ab, int ob,
             pbr[ph] = p.kr[kb + ob + n];
             pbi[ph] = p.ki[kb + ob + n];
         }
-    } else if (MODE == 2) {
+    } else if (MODE >= 2) {
         //single buffer preload, level 0 pulls operands over a barrier
         const long kb = (long)b * p.n_k;
         for (int n = threadIdx.x; n < M; n += RX_TPB) {
@@ -194,7 +205,7 @@ __device__ void band_two(const RP& p, int b, int ab, int ob,
         const int rb = (int)(__brev((unsigned)ell) >> (32 - clog2(R0)));
         constexpr int NIT = M / RX_TPB > 0 ? M / RX_TPB : 1;
         float pvr[NIT], pvi[NIT];
-        if (MODE == 2) {
+        if (MODE >= 2) {
             //the level 0 output overwrites the preloaded cells, all
             //reads must precede the first write
             int it = 0;
@@ -212,7 +223,7 @@ __device__ void band_two(const RP& p, int b, int ab, int ob,
             if (MODE == 0) {
                 get<MODE>(p, b, ab, ob, n1 + R1 * rb,
                           n1 * R0 + ell, vr, vi);
-            } else if (MODE == 2) {
+            } else if (MODE >= 2) {
                 vr = pvr[itc];
                 vi = pvi[itc];
             } else {
@@ -308,7 +319,7 @@ __device__ void band_three(const RP& p, int b, int ab, int ob,
             pbr[ph] = p.kr[kb + ob + n];
             pbi[ph] = p.ki[kb + ob + n];
         }
-    } else if (MODE == 2) {
+    } else if (MODE >= 2) {
         const long kb = (long)b * p.n_k;
         for (int n = threadIdx.x; n < 2048; n += RX_TPB) {
             const int ph = phys2048(n >> 6, n & 7, (n >> 3) & 7);
@@ -321,7 +332,7 @@ __device__ void band_three(const RP& p, int b, int ab, int ob,
     {
         const int rb = (int)(__brev((unsigned)lane) >> 27);
         float pvr[16], pvi[16];
-        if (MODE == 2) {
+        if (MODE >= 2) {
             int it = 0;
             for (int q = warp; q < 64; q += 4, it++) {
                 const int ph = phys2048(rb, q & 7, q >> 3);
@@ -336,7 +347,7 @@ __device__ void band_three(const RP& p, int b, int ab, int ob,
             if (MODE == 0) {
                 get<MODE>(p, b, ab, ob, q + 64 * rb,
                           q * 32 + lane, vr, vi);
-            } else if (MODE == 2) {
+            } else if (MODE >= 2) {
                 vr = pvr[itc];
                 vi = pvi[itc];
             } else {

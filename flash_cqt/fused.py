@@ -457,7 +457,11 @@ class FusedOctCQT:
                   | (self.radix["aidx"] == HALF)).float()
         agr = self.radix["gav"] * (N / 2) / xms * (1.0 + edge_s)
         self.radix["agr"] = agr.contiguous()
-        self.radix["agi"] = (agr * self.radix["asgn"]).contiguous()
+        #the adjoint of the real fft ignores the imaginary parts of the
+        #dc and nyquist bins, the tail does not, so the edge taps get a
+        #zero imaginary gain and the accumulated imag vanishes exactly
+        self.radix["agi"] = (agr * self.radix["asgn"]
+                             * (1.0 - edge_s)).contiguous()
         #per point band length is the same in either table order
         edge_l = ((self.radix["p1"] == 0)
                   & (self.radix["p2"] == 0)).float()
