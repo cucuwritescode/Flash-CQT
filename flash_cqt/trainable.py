@@ -139,23 +139,29 @@ class TrainableCQT:
         return gkr, gki
 
     def fwd(self, x):
-        """x [B, N] real to (blocks, side), complex, gradients flow"""
-        kr, ki = _Analysis.apply(x.contiguous(), self)
+        """x [..., N] real to (blocks, side), complex, gradients flow,
+        any leading shape is preserved on the blocks"""
+        lead = x.shape[:-1]
+        kr, ki = _Analysis.apply(x.reshape(-1, N).contiguous(), self)
         vs = []
         for b, M, off in self.f.gspec:
             vs.append(torch.complex(kr[:, off:off + b * M],
                                     ki[:, off:off + b * M])
-                      .view(-1, b, M))
+                      .view(*lead, b, M))
         ng = len(self.cqt.groups)
         return vs[:ng], vs[ng:]
 
     def bwd(self, blocks, side=None):
         """inverse of fwd, gradients flow"""
         allb = list(blocks) + list(side or [])
-        B = allb[0].shape[0]
+        lead = allb[0].shape[:-2]
+        B = 1
+        for d in lead:
+            B *= d
         flat = torch.cat([c.reshape(B, -1) for c in allb], dim=-1)
         return _Synthesis.apply(flat.real.contiguous(),
-                                flat.imag.contiguous(), self)
+                                flat.imag.contiguous(),
+                                self).reshape(*lead, N)
 
 
 class _Analysis(torch.autograd.Function):
