@@ -1,0 +1,4 @@
+#the benchmark scripts and notes are the lab notebook, not the library,
+#keep the language statistics about what actually ships
+bench/** linguist-documentation
+docs/** linguist-documentation
